@@ -1,41 +1,32 @@
 #!/usr/bin/env python
 import subprocess
-import os
 import sys
+import os
 import tempfile
 import json
 from typing import Dict, Set, List, Tuple
 
-def get_project_dependencies(project_path: str) -> Dict[str, str]:
-    """使用pipreqs获取项目直接依赖"""
+def get_imported_packages(project_path: str) -> set:
+    """使用pipreqs扫描项目中实际导入的包"""
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False) as temp_file:
         temp_path = temp_file.name
     
     try:
-        # 在Windows上使用python -m pipreqs.pipreqs
-        pipreqs_cmd = [sys.executable, '-m', 'pipreqs.pipreqs']
-        result = subprocess.run(pipreqs_cmd + [project_path, '--force', '--savepath', temp_path], 
-                      check=True, capture_output=True, text=True)
+        # 使用pipreqs扫描项目
+        result = subprocess.run([sys.executable, '-m', 'pipreqs.pipreqs', project_path, '--force', '--savepath', temp_path],
+                              check=True, capture_output=True, text=True)
         
-        if result.stderr:
-            print("pipreqs 输出:", result.stderr)
-        
+        # 读取扫描结果
+        imported_packages = set()
         with open(temp_path, 'r') as f:
-            requirements = [line.strip() for line in f if line.strip()]
+            for line in f:
+                package = line.strip().split('==')[0].lower()
+                imported_packages.add(package)
         
-        # 解析依赖和版本
-        deps = {}
-        for req in requirements:
-            if '==' in req:
-                name, version = req.split('==')
-                deps[name.lower()] = version
-            else:
-                deps[req.lower()] = None
-        
-        return deps
+        return imported_packages
     except subprocess.CalledProcessError as e:
         print(f"警告: pipreqs 执行失败: {e.stderr.decode() if e.stderr else str(e)}")
-        return {}
+        return set()
     finally:
         try:
             os.unlink(temp_path)
@@ -43,16 +34,34 @@ def get_project_dependencies(project_path: str) -> Dict[str, str]:
             pass
 
 def get_package_version(package_name: str) -> str:
-    """使用pip show获取包的版本信息"""
+    """获取包的版本号，使用多种方法尝试"""
     try:
+        # 方法1: 使用pip show
         result = subprocess.run([sys.executable, '-m', 'pip', 'show', package_name],
                               check=True, capture_output=True, text=True)
         for line in result.stdout.splitlines():
             if line.startswith('Version: '):
                 return line.split('Version: ')[1].strip()
+        
+        # 方法2: 使用pip freeze
+        result = subprocess.run([sys.executable, '-m', 'pip', 'freeze'],
+                              check=True, capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if line.lower().startswith(f"{package_name}=="):
+                return line.split('==')[1].strip()
+        
+        # 方法3: 使用pipdeptree
+        result = subprocess.run([sys.executable, '-m', 'pipdeptree', '--freeze'],
+                              check=True, capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if line.lower().startswith(f"{package_name}=="):
+                return line.split('==')[1].strip()
+        
+        # 方法4: 尝试安装最新版本
+        print(f"警告: 未能找到 {package_name} 的版本信息，将使用最新版本")
+        return "latest"
     except subprocess.CalledProcessError:
-        pass
-    return ''
+        return "latest"
 
 def get_dependency_tree() -> Tuple[Dict[str, str], Dict[str, Set[str]]]:
     """使用pipdeptree获取依赖树
@@ -107,79 +116,79 @@ def get_dependency_tree() -> Tuple[Dict[str, str], Dict[str, Set[str]]]:
         print(f"警告: 处理依赖时出错: {str(e)}")
         return {}, {}
 
-def get_required_dependencies(direct_deps: Dict[str, str], deps_graph: Dict[str, Set[str]]) -> Set[str]:
+def get_all_dependencies(direct_deps: set, deps_graph: Dict[str, Set[str]]) -> set:
     """获取所有必需的依赖（包括子依赖）"""
-    required = set()
-    to_process = set(direct_deps.keys())
+    all_deps = set(direct_deps)
+    to_process = set(direct_deps)
     
     while to_process:
         dep = to_process.pop()
-        if dep not in required:
-            required.add(dep)
-            # 添加子依赖到处理队列
-            if dep in deps_graph:
-                to_process.update(deps_graph[dep] - required)
+        if dep in deps_graph:
+            new_deps = deps_graph[dep] - all_deps
+            all_deps.update(new_deps)
+            to_process.update(new_deps)
     
-    return required
+    return all_deps
 
-def generate_requirements(project_path: str, output_file: str = 'requirements.txt', include_subdeps: bool = True):
+def normalize_package_name(package_name: str) -> str:
+    """标准化包名（处理特殊字符）"""
+    # 处理带连字符的包名
+    if '-' in package_name:
+        return package_name.replace('-', '_')
+    return package_name
+
+def generate_requirements(project_path: str, output_file: str = 'requirements.txt'):
     """生成项目依赖文件"""
-    print("正在扫描项目直接依赖...")
-    direct_deps = get_project_dependencies(project_path)
+    print("正在扫描项目导入的包...")
+    direct_deps = get_imported_packages(project_path)
     
     if not direct_deps:
-        print("错误: 未能找到任何项目依赖")
+        print("错误: 未能找到任何导入的包")
         return
     
-    print(f"\n找到 {len(direct_deps)} 个直接依赖:")
-    for dep in sorted(direct_deps.keys()):
-        print(f"  - {dep}")
+    print(f"\n找到 {len(direct_deps)} 个直接导入的包:")
+    for package in sorted(direct_deps):
+        print(f"  - {package}")
     
-    print("\n正在获取依赖关系...")
+    print("\n正在分析依赖关系...")
     versions, deps_graph = get_dependency_tree()
     
-    if not versions:
+    if not versions or not deps_graph:
         print("错误: 未能获取依赖信息")
         return
     
-    # 确定要包含的依赖
-    if include_subdeps:
-        print("正在分析依赖关系...")
-        required_deps = get_required_dependencies(direct_deps, deps_graph)
-        subdeps = required_deps - set(direct_deps.keys())
-        print(f"项目直接依赖: {len(direct_deps)} 个")
-        print(f"必要的子依赖: {len(subdeps)} 个")
-    else:
-        required_deps = set(direct_deps.keys())
-        print("仅包含直接依赖")
+    # 获取所有必需的依赖
+    all_deps = get_all_dependencies(direct_deps, deps_graph)
+    subdeps = all_deps - direct_deps
+    
+    if subdeps:
+        print(f"\n找到 {len(subdeps)} 个必要的子依赖:")
+        for package in sorted(subdeps):
+            print(f"  - {package}")
     
     # 生成requirements.txt
     print("\n正在生成requirements.txt...")
     with open(output_file, 'w', encoding='utf-8') as f:
-        # 首先写入直接依赖
         f.write("# 直接依赖\n")
-        for dep in sorted(direct_deps.keys()):
-            version = direct_deps[dep] or versions.get(dep, '')
-            if not version:
-                version = get_package_version(dep)
-            if version:
-                f.write(f"{dep}=={version}\n")
+        for package in sorted(direct_deps):
+            normalized_name = normalize_package_name(package)
+            version = versions.get(normalized_name, '') or get_package_version(normalized_name)
+            if version and version != "latest":
+                f.write(f"{package}=={version}\n")
             else:
-                print(f"警告: 未能找到 {dep} 的版本信息")
-                f.write(f"{dep}\n")
+                print(f"警告: 未能找到 {package} 的版本信息")
+                f.write(f"{package}\n")
         
-        # 如果包含子依赖，则写入子依赖
-        if include_subdeps and subdeps:
+        if subdeps:
             f.write("\n# 子依赖\n")
-            for dep in sorted(subdeps):
-                version = versions.get(dep, '')
-                if not version:
-                    version = get_package_version(dep)
-                if version:
-                    f.write(f"{dep}=={version}\n")
+            for package in sorted(subdeps):
+                normalized_name = normalize_package_name(package)
+                version = versions.get(normalized_name, '') or get_package_version(normalized_name)
+                if version and version != "latest":
+                    f.write(f"{package}=={version}\n")
                 else:
-                    print(f"警告: 未能找到 {dep} 的版本信息")
-                    f.write(f"{dep}\n")
+                    print(f"警告: 未能找到 {package} 的版本信息")
+                    f.write(f"{package}\n")
     
     print(f"\n依赖已保存到 {output_file}")
 
@@ -189,7 +198,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='生成项目依赖文件')
     parser.add_argument('--path', default='.', help='项目路径')
     parser.add_argument('--output', default='requirements.txt', help='输出文件路径')
-    parser.add_argument('--no-subdeps', action='store_true', help='不包含子依赖')
     
     args = parser.parse_args()
-    generate_requirements(args.path, args.output, not args.no_subdeps) 
+    generate_requirements(args.path, args.output) 
